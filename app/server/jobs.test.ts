@@ -135,15 +135,46 @@ describe('required inputs', () => {
     assert.equal(status().song, 'provided');
     assert.deepEqual(J.openInputs(id), []);
   });
+  // logs/ blocked by a file stands in for a locked folder; a directory at job.json's temp path makes chat() fail too (a full disk)
+  const lostWarnings = (id: string) => J.load(id).chat.filter((c) => /寫不進去|could not be written/.test(c.text || '')).length;
+  const blockLog = (id: string) => writeFileSync(join(J.dirOf(id), 'logs'), 'x');
+  const unblockLog = (id: string) => rmSync(join(J.dirOf(id), 'logs'), { recursive: true, force: true });
+  const jobTmp = (id: string) => join(J.dirOf(id), `job.json.${process.pid}.tmp`);
   test('an unwritable event log warns once in chat instead of losing history silently', async () => {
     const S = await import('./store.ts');
     const cid = newJob().id;
-    writeFileSync(join(J.dirOf(cid), 'logs'), 'x');   // block the log path (disk-full/locked-folder land here)
+    blockLog(cid);
     S.log(cid, { type: 'text', text: 'hello' });
     S.log(cid, { type: 'text', text: 'world' });
-    const texts = J.load(cid).chat.map((c) => c.text || '');
-    assert.equal(texts.filter((t) => /not writable|寫不進去/.test(t)).length, 1);
+    assert.equal(lostWarnings(cid), 1);
     assert.ok(S.recentLog(cid).some((e) => (e as { text?: string }).text === 'hello'));
+  });
+  test('a warning that could not be saved (full disk) is retried, not dropped', async (t) => {
+    const S = await import('./store.ts');
+    const cid = newJob().id;
+    t.mock.timers.enable({ apis: ['Date'], now: Date.now() });
+    blockLog(cid); mkdirSync(jobTmp(cid));
+    S.log(cid, { type: 'text', text: 'a' });
+    rmSync(jobTmp(cid), { recursive: true });
+    S.log(cid, { type: 'text', text: 'b' });   // too soon to retry: no chat write on every event
+    assert.equal(lostWarnings(cid), 0);
+    t.mock.timers.tick(31_000);
+    S.log(cid, { type: 'text', text: 'c' });
+    assert.equal(lostWarnings(cid), 1);
+  });
+  test('writes coming back post the warning if it never got through, and a new failure warns again', async () => {
+    const S = await import('./store.ts');
+    const cid = newJob().id;
+    blockLog(cid); mkdirSync(jobTmp(cid));
+    S.log(cid, { type: 'text', text: 'a' });
+    unblockLog(cid); rmSync(jobTmp(cid), { recursive: true });
+    S.log(cid, { type: 'text', text: 'b' });
+    assert.equal(lostWarnings(cid), 1);
+    S.log(cid, { type: 'text', text: 'c' });   // healthy: nothing new
+    assert.equal(lostWarnings(cid), 1);
+    unblockLog(cid); blockLog(cid);
+    S.log(cid, { type: 'text', text: 'd' });
+    assert.equal(lostWarnings(cid), 2);
   });
 });
 

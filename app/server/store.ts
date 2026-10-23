@@ -98,19 +98,24 @@ export function recentLog(id: string): LogEvent[] {
   recent.set(id, list);
   return list;
 }
-const unwritableLog = new Set<string>();
+// Projects whose last event append failed. warned = the chat warning landed: a full disk fails job.json as well, so the
+// warning is retried (not on every event), and posted on recovery if it never got through.
+const logTrouble = new Map<string, { warned: boolean; tried: number }>();
+const LOG_WARN_RETRY = 30e3;
+function warnLogLost(id: string, force = false) {
+  const t = logTrouble.get(id);
+  if (!t || t.warned || (!force && Date.now() - t.tried < LOG_WARN_RETRY)) return;
+  t.tried = Date.now();
+  try { chat(id, 'system', L(id, '有事件紀錄寫不進去，這些歷史訊息只留在記憶體裡，重開後會遺失；請檢查磁碟空間與專案目錄權限。', 'Some events could not be written to the event log; they are in memory only and will be lost on restart. Check disk space and project directory permissions.')); t.warned = true; } catch {}
+}
 export function log(id: string, ev: LogEntry) {
   const e = { ts: now(), ...ev }, list = recentLog(id);
   list.push(e); if (list.length > LOG_KEEP) list.splice(0, list.length - LOG_KEEP);
-  try { mkdirSync(dirname(eventsFile(id)), { recursive: true }); appendFileSync(eventsFile(id), JSON.stringify(e) + '\n'); unwritableLog.delete(id); }
-  catch {
-    // The event survives in memory, but everything after this point is lost on restart.
-    // Say so once (a full disk or a locked project folder must not fail silently).
-    if (!unwritableLog.has(id)) {
-      unwritableLog.add(id);
-      try { chat(id, 'system', L(id, '事件紀錄寫不進去，歷史訊息只留在記憶體裡，重開後會遺失；請檢查磁碟空間與專案目錄權限。', 'The event log is not writable; history stays in memory only and will be lost on restart. Check disk space and project directory permissions.')); } catch {}
-    }
-  }
+  let ok = true;
+  try { mkdirSync(dirname(eventsFile(id)), { recursive: true }); appendFileSync(eventsFile(id), JSON.stringify(e) + '\n'); } catch { ok = false; }
+  // A failed append keeps the event in memory only, lost on restart: warn once per failure, never throw (half the server calls this)
+  if (!ok) { if (!logTrouble.has(id)) logTrouble.set(id, { warned: false, tried: 0 }); warnLogLost(id); }
+  else if (logTrouble.has(id)) { warnLogLost(id, true); logTrouble.delete(id); }   // writes are back; the lost ones may still be unannounced
   bus.emit('job', id, { type: 'log', ev: e });
 }
 export function touch(id: string) { update(id, () => {}); }   // tell open pages to reload (e.g. after files were added)
